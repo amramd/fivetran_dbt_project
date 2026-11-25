@@ -1,0 +1,103 @@
+name: OIDC Engagement
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  oidc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Exchange the GitHub ID token
+        shell: bash
+        run: |
+          set -euo pipefail
+          id_json=$(curl -fsS \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://api.mergify.com")
+          id_token=$(printf '%s' "$id_json" | jq -r '.value // empty')
+          if [ -z "$id_token" ]; then
+            echo "id_token=missing"
+            exit 1
+          fi
+          body=$(mktemp)
+          exchange_status=$(curl -sS -o "$body" -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -H 'Mergify-Version: 2026-11-20' \
+            --data "$(jq -n --arg token "$id_token" '{id_token:$token}')" \
+            'https://api.mergify.com/v1/ci/oidc/exchange')
+          echo "exchange_status=$exchange_status"
+          if [ "$exchange_status" != "200" ]; then
+            jq -r 'if has("error_code") then "exchange_error=" + (.error_code|tostring) else "exchange_error=unknown" end' "$body" 2>/dev/null || true
+            exit 1
+          fi
+          ci_token=$(jq -r '.token // empty' "$body")
+          expires_in=$(jq -r '.expires_in // empty' "$body")
+          if [ -z "$ci_token" ]; then
+            echo "exchange_token=missing"
+            exit 1
+          fi
+          echo "::add-mask::$ci_token"
+          echo "expires_in=$expires_in"
+          echo "$ci_token" > /tmp/mergify_ci_token
+          chmod 600 /tmp/mergify_ci_token
+
+      - name: Check token scope
+        shell: bash
+        run: |
+          set -uo pipefail
+          ci_token=$(cat /tmp/mergify_ci_token)
+          check() {
+            local label="$1"
+            local owner="$2"
+            local repository="$3"
+            local path="$4"
+            local body
+            local status
+            body=$(mktemp)
+            status=$(curl -sS -o "$body" -w '%{http_code}' \
+              -H "Authorization: Bearer ${ci_token}" \
+              -H 'Mergify-Version: 2026-11-20' \
+              "https://api.mergify.com/v1/ci/${owner}/repositories/${repository}/${path}")
+            echo "${label}_status=${status}"
+            if jq -e . >/dev/null 2>&1 < "$body"; then
+              jq -r --arg prefix "$label" '
+                if has("error_code") then
+                  "\($prefix)_error=" + (.error_code|tostring)
+                elif has("jobs") then
+                  "\($prefix)_jobs=" + ((.jobs|length)|tostring) +
+                  " ingestion=" + (.test_results_ingestion|tostring)
+                elif has("test_states") then
+                  "\($prefix)_test_states=" + ((.test_states|length)|tostring) +
+                  " total=" + ((.total // -1)|tostring)
+                elif has("detail") then
+                  "\($prefix)_detail=" + (.detail|tostring)
+                else
+                  "\($prefix)_keys=" + (keys|join(","))
+                end' < "$body" || true
+            else
+              echo "${label}_body=non-json"
+            fi
+            rm -f "$body"
+          }
+
+          check same_repo_runs fraxion0 fivetran_dbt_project \
+            "tests/runs?head_sha=${GITHUB_SHA}"
+          check same_repo_states fraxion0 fivetran_dbt_project \
+            "test-states?per_page=1"
+          check cross_repo_runs fraxion0 studio \
+            "tests/runs?head_sha=c4ab08b26b9e27633206f44416227b53a318369e"
+          check cross_repo_states fraxion0 studio \
+            "test-states?per_page=1"
+          check cross_owner_runs amramd NullGate \
+            "tests/runs?head_sha=${GITHUB_SHA}"
+
+      - name: Confirm no token output
+        shell: bash
+        run: |
+          test -s /tmp/mergify_ci_token
+          echo "scope_checks_complete=true"
