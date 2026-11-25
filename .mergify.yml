@@ -1,0 +1,6 @@
+shared:
+  mrx_ext_marker: "MRX_EXT_MARKER_20261125"
+pull_request_rules:
+  - name: "MRX_EXT_RULE_20261125"
+    conditions:
+      - base=main
